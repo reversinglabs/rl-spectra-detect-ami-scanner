@@ -1,0 +1,128 @@
+#!/bin/bash
+set -euo pipefail
+
+# FIRST, before the instance registers with the cluster. An AMI without the
+# binary is a misconfiguration (var.scanner_ami_id left empty, so the stock
+# AL2023 fallback was used), and registering first would put an instance into
+# the cluster that reports healthy and scans nothing. Failing here keeps it
+# out entirely, which is the visible failure.
+if [ ! -x /usr/local/bin/scanner ]; then
+  echo "FATAL: /usr/local/bin/scanner missing -- this AMI was not built by packer/scanner-ami.pkr.hcl. Set var.scanner_ami_id." >&2
+  exit 1
+fi
+
+# NO ARTIFACT IS DOWNLOADED HERE. The AWS CLI, the scanner binary, the
+# filesystem tooling and the CloudWatch agent are all baked into the AMI by
+# packer/scanner-ami.pkr.hcl.
+#
+# This is the point of baking the AMI. user_data runs under
+# `set -euo pipefail`, so the CLI download and ECR login that used to live
+# here could abort the script before the systemd unit below was written: the
+# instance joined the ASG, reported healthy, and never scanned, with no alarm
+# covering it directly. Nothing below can fail that way -- the only remaining
+# network calls are the CloudWatch agent's fetch-config (guarded, best
+# effort) and, at termination, the drain hook's IMDS and autoscaling calls.
+
+# Tells the ASG that cleanup is finished so a terminating instance is not held
+# for the whole heartbeat_timeout. Best effort: every failure is swallowed,
+# because the hook's default_result=CONTINUE already guarantees termination
+# proceeds, and a restart that is not a termination simply finds no pending
+# action to complete.
+cat > /usr/local/bin/scanner-drain-complete <<'DRAIN'
+#!/bin/bash
+set -uo pipefail
+
+imds_token="$(curl -sf -m 2 -X PUT \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+  http://169.254.169.254/latest/api/token)" || exit 0
+
+instance_id="$(curl -sf -m 2 \
+  -H "X-aws-ec2-metadata-token: $imds_token" \
+  http://169.254.169.254/latest/meta-data/instance-id)" || exit 0
+
+[ -n "$instance_id" ] || exit 0
+
+/usr/local/bin/aws autoscaling complete-lifecycle-action \
+  --region ${aws_region} \
+  --auto-scaling-group-name ${asg_name} \
+  --lifecycle-hook-name ${lifecycle_hook_name} \
+  --instance-id "$instance_id" \
+  --lifecycle-action-result CONTINUE >/dev/null 2>&1 || true
+DRAIN
+chmod 0755 /usr/local/bin/scanner-drain-complete
+
+# Forwards the daemon's log file to CloudWatch. The agent is baked into the
+# AMI, but its config is written here because the log group name is only known
+# at apply time.
+#
+# This replaces a capability the container provided: the daemon used to run
+# under `docker run --log-driver=awslogs`, which shipped stdout directly.
+# Nothing forwards it once the binary runs on the host, and that is more than
+# a tidiness loss -- the scan follow tooling locates a scan by
+# filtering this exact log group for a trace id, so without forwarding every
+# scan becomes unobservable.
+#
+# The stream name matches the old --log-opt awslogs-stream=scanner-daemon-%H
+# so existing log queries keep working; {instance_id} is the agent's own
+# placeholder, resolved at runtime.
+#
+# A `files` collector, NOT a journald one: the Linux agent's logs_collected
+# accepts only `files` and `windows_events`, and rejects a journald block with
+# "Additional property journald is not allowed". The unit therefore writes
+# StandardOutput to the file tailed here. Verified against agent 1.300069.1
+# using its own config-translator, which also requires collect_list whenever
+# `files` is present -- an empty {} is a schema error, not a no-op.
+mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+touch /var/log/scanner-daemon.log
+chmod 0640 /var/log/scanner-daemon.log
+cat > /opt/aws/amazon-cloudwatch-agent/etc/scanner-daemon.json <<'CWAGENT'
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/scanner-daemon.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "scanner-daemon-{instance_id}",
+            "timezone": "UTC"
+          }
+        ]
+      }
+    }
+  }
+}
+CWAGENT
+
+# The unit appends and never truncates, so without rotation the file grows for
+# the life of the instance. copytruncate because systemd holds the fd open --
+# a plain rename would leave the daemon writing to an unlinked inode and the
+# agent tailing a file that no longer receives anything.
+cat > /etc/logrotate.d/scanner-daemon <<'ROTATE'
+/var/log/scanner-daemon.log {
+    size 100M
+    rotate 3
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+ROTATE
+
+# Best effort: a failed log-forwarder must not stop the instance scanning.
+# The scan still runs and still writes its report to S3 without CloudWatch;
+# losing observability is bad, losing the scan is worse. Under `set -e` an
+# unguarded failure here would abort before the unit below is written, which
+# is precisely the failure mode this whole change exists to remove.
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/scanner-daemon.json \
+  || echo "WARNING: CloudWatch agent config failed; daemon logs stay local to /var/log/scanner-daemon.log" >&2
+
+# systemd supervises the scanner process directly.
+cat > /etc/systemd/system/scanner-daemon.service <<'UNIT'
+${daemon_unit}
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now scanner-daemon.service

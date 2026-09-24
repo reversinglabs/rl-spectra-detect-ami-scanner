@@ -1,0 +1,90 @@
+[Unit]
+Description=AMI scanner daemon (drains the scan queue)
+
+# Docker is deliberately absent from the daemon's start path; it runs on the
+# host only for the ECS agent.
+After=network-online.target
+Wants=network-online.target
+
+# In [Unit], NOT [Service]: systemd reads the start-rate limit here and
+# silently ignores it under [Service], so a daemon that fails forever would
+# otherwise restart unthrottled. Five starts in ten minutes, then the unit
+# gives up and stays failed -- which is what the depth-with-no-throughput
+# alarm is there to surface.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# An empty queue is a clean exit, not a failure, so the unit restarts on
+# success too -- there is no other way for the daemon to wait for work it
+# cannot see.
+#
+# RestartSec covers a crash loop, not idling: --idle-timeout below keeps the
+# daemon long-polling in-process, so an empty queue no longer ends the run
+# after 20 seconds. A restart now means something actually went wrong.
+Restart=always
+RestartSec=60
+
+# AWS_ROLE_ARN points at the scan role, which the daemon assumes at startup
+# through the SDK: the instance's own credentials are near-powerless by
+# design and everything a scan does is reached by assumption.
+#
+# The RL token is passed as a secret ARN, never a value, so the credential
+# appears in neither this unit file nor the process table.
+Environment=AWS_REGION=${aws_region}
+Environment=AWS_ROLE_ARN=${scan_role_arn}
+Environment=SCANNER_SCAN_QUEUE_URL=${scan_queue_url}
+Environment=SCANNER_LOG_LEVEL=${log_level}
+Environment=SCANNER_OUTPUT_S3_BUCKET=${results_bucket}
+Environment=SCANNER_OUTPUT_S3_PREFIX=reports
+Environment=REVERSINGLABS_API_URL=${reversinglabs_api_url}
+Environment=REVERSINGLABS_API_TOKEN_SECRET_ARN=${rl_token_secret_arn}
+# Quoted because a tag value containing a space would otherwise be split.
+# systemd's Environment= takes one KEY=VALUE per quoted token, so this stays
+# a single variable however the operator sets var.tag_*.
+Environment="SCANNER_AWS_RESOURCE_TAGS=${resource_tags}"
+${allowed_task_hosts_env}
+${sns_topic_env}
+
+# One line per filter set; absent entirely when none is.
+${filter_env}
+
+# Runs as root: mount(2) is privileged, and attaching and mounting a scan
+# volume is the job.
+ExecStart=/usr/local/bin/scanner daemon --max-scans ${max_scans} --idle-timeout ${idle_timeout}
+
+# SIGTERM: the daemon abandons the in-flight scan and runs cleanup -- detach
+# the volume, delete the copied snapshot. Sized to CLEANUP, not to a scan. An
+# interrupted scan leaves its message queued, so the asset redelivers and
+# another worker scans it; waiting out a 45-minute scan to avoid work that
+# redelivery redoes anyway buys nothing.
+KillSignal=SIGTERM
+TimeoutStopSec=300
+
+# Written to a FILE, not journald, because the CloudWatch agent's Linux build
+# has no journald collector -- `logs_collected` accepts `files` and
+# `windows_events` only, and a journald block is rejected outright with
+# "Additional property journald is not allowed". Verified against
+# amazon-cloudwatch-agent 1.300069.1 with its own config-translator.
+#
+# The CloudWatch agent tails this file and ships it to the stack's log group
+# (configured by user_data, which is where the group name is known). Not
+# cosmetic: the scan follow tooling locates a scan by filtering that group
+# for a trace id, so losing it makes every scan unobservable while still
+# appearing to work.
+#
+# append:, not truncate:, so a restart does not discard the previous run's
+# logs before the agent has shipped them. Rotation is logrotate's job, via the
+# config user_data writes alongside the agent's.
+StandardOutput=append:/var/log/scanner-daemon.log
+StandardError=append:/var/log/scanner-daemon.log
+SyslogIdentifier=scanner-daemon
+
+# Best effort, hence the "-": the ASG hook's default_result=CONTINUE already
+# guarantees termination proceeds.
+ExecStopPost=-/usr/local/bin/scanner-drain-complete
+
+[Install]
+WantedBy=multi-user.target

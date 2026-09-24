@@ -1,0 +1,110 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored --
+# it holds account-specific IDs and must never be committed.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+
+# ---------------------------------------------------------------------------
+# Required -- no defaults. Terraform fails immediately without these.
+# ---------------------------------------------------------------------------
+
+# AWS CLI profile to deploy with.
+aws_profile = "my-profile"
+
+# VPC and public subnets to place the scanner fleet in. The subnets must be
+# in var.vpc_id and must reach the internet (the daemon calls the EC2, SQS,
+# S3 and Secrets Manager APIs, and submits files to Spectra Detect).
+vpc_id     = "vpc-xxxxxxxxxxxxxxxxx"
+subnet_ids = ["subnet-xxxxxxxxxxxxxxxxx"]
+
+# ReversingLabs Spectra Detect host. May be a single Worker or a Hub; a Hub
+# also needs reversinglabs_allowed_task_hosts below.
+reversinglabs_api_url = "https://spectra-detect.example.com"
+
+# ---------------------------------------------------------------------------
+# API token -- required, but do NOT put it in this file.
+# ---------------------------------------------------------------------------
+# Terraform creates a Secrets Manager secret from reversinglabs_api_token.
+# Pass it out of band so it never lands in a tfvars file or shell history:
+#
+#   export TF_VAR_reversinglabs_api_token='...'
+#
+# Or point at a secret you already own and leave the token unset:
+#
+#   reversinglabs_api_token_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:my-secret"
+#
+# Exactly one of the two is required; setting both is rejected.
+
+# ---------------------------------------------------------------------------
+# Optional
+# ---------------------------------------------------------------------------
+
+# aws_region  = "us-east-1"
+# environment = "dev"          # feeds every resource name; renames the stack
+
+# Worker hosts a Hub may name, besides the api_url host itself. Only needed
+# when reversinglabs_api_url is a Hub. An entry is an exact host, a leading
+# dot domain suffix covering a pool, or "*" to trust any host the Hub names.
+# reversinglabs_allowed_task_hosts = [".workers.internal"]
+
+# AMI carrying the scanner binary. Empty falls back to stock AL2023, which
+# boots and registers but has no scanner, so it never scans.
+# scanner_ami_id = "ami-xxxxxxxxxxxxxxxxx"
+
+# Fleet sizing. The ASG scales on queue backlog per instance.
+# instance_type      = "t3.medium"
+# asg_min_size       = 0
+# asg_max_size       = 2
+# asg_desired_capacity = 1
+
+# Scheduled scanning. Off by default so applying never silently starts
+# scanning. When on, the dispatcher enqueues every tagged asset it finds.
+# enable_scan_schedule     = false
+# scan_schedule_expression = "rate(1 day)"
+# scan_schedule_timezone   = "UTC"
+
+# Detection notifications. Either let the stack create and own a topic, or
+# publish to one you already own -- the two are mutually exclusive.
+# create_sns_topic    = true
+# sns_alert_topic_arn = "arn:aws:sns:us-east-1:123456789012:my-topic"
+
+# scan_log_level = "info"
+
+# ---------------------------------------------------------------------------
+# Scan scope -- see "File filters" in ../README.md for what each one does
+# ---------------------------------------------------------------------------
+# All off by default: every file the scan mode selected is uploaded. Sizes are
+# in bytes.
+
+# scan_mode = "full-filesystem"          # or binary-focused, critical-paths
+
+# scan_exclude_categories = ["image", "audio", "video", "font"]
+# scan_include_categories = ["document", "archive"]
+# scan_exclude_mime       = ["image/svg"]
+# scan_include_mime       = ["application/x-executable"]
+# scan_exclude_paths      = ["/var/cache", "/var/tmp"]
+# scan_include_paths      = ["/usr/bin", "/usr/sbin"]
+# scan_file_extensions    = ["so", "bin", "exe"]
+
+# scan_max_files     = 5000
+# scan_max_file_size = 104857600
+# scan_min_file_size = 100
+
+# ---------------------------------------------------------------------------
+# Resource tags
+# ---------------------------------------------------------------------------
+# Applied to every resource this stack creates, and to the EBS snapshots and
+# volumes the scanner creates at runtime. Empty by default -- set whatever your
+# account's tag policy and cost-allocation scheme require.
+#
+# If an account tag policy requires a key you have not set here, the create is
+# denied with a bare AccessDenied naming the action, which reads exactly like a
+# missing IAM permission.
+# resource_tags = {
+#   Environment = "prod"
+#   Owner       = "security"
+#   CostCenter  = "1234"
+# }
+
+# Value of the Project tag. Load-bearing: the task role grants
+# AttachVolume/DetachVolume only on instances carrying it.
+# tag_project = "detect-ami-scanner"

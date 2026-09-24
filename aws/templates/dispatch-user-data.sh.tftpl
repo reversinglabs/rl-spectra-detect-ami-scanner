@@ -1,0 +1,140 @@
+#!/bin/bash
+# Runs `scanner dispatch` once on a throwaway instance, then terminates.
+#
+# Deliberately NOT `set -e`. This script's whole purpose is to report an exit
+# code and shut down; aborting early on an error would skip both, and the
+# instance would terminate anyway under InstanceInitiatedShutdownBehavior --
+# silently, which is the failure mode this path has to avoid. Every step
+# below is therefore explicitly guarded and the script always reaches the end.
+set -uo pipefail
+
+LOG=/var/log/scanner-dispatch.log
+touch "$LOG"
+chmod 0640 "$LOG"
+
+# Needed to poll for this instance's own log stream in finish(). The agent
+# resolves {instance_id} in the stream name itself; the shell has to ask IMDS.
+# IMDSv2 is required on these instances, so the token call is not optional.
+IMDS_TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' 2>/dev/null || echo "")
+INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: $${IMDS_TOKEN}" \
+  http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo "")
+
+# Ships the run's log and exit status to CloudWatch, then halts. Called on
+# every path out of this script, including the missing-binary path -- an
+# instance that terminates without writing this line is indistinguishable
+# from one that never booted, which is what the dispatch alarm watches for.
+finish() {
+  code="$1"
+  echo "dispatch run finished exit_code=$${code}" >> "$LOG"
+
+  # Wait for the agent to actually publish before halting, rather than
+  # assuming it has. `-a stop` returns as soon as it has signalled the agent,
+  # not when the agent has drained, and the agent takes ~10s from start to its
+  # first PutLogEvents. A dispatch run finishes in seconds, so an instance that
+  # stopped the agent and halted immediately terminated INSIDE that window and
+  # published nothing at all -- no log stream was ever created, which is
+  # indistinguishable from an instance that never booted.
+  #
+  # Poll for this instance's own stream instead. The stream is created by the
+  # first successful publish, so its existence is proof the log reached
+  # CloudWatch; absence after the timeout means it did not, and the warning
+  # below is the only trace left. Bounded so a CloudWatch outage delays
+  # termination by at most 90s rather than stranding the instance.
+  published=no
+
+  # Without an instance id the prefix below would match every dispatch stream
+  # in the group, so any previous run's stream would satisfy the poll
+  # immediately and this run would halt unpublished again. Fall back to a
+  # fixed wait, which is weaker but not wrong.
+  if [ -z "$${INSTANCE_ID}" ]; then
+    echo "WARNING: instance id unavailable; waiting a fixed interval instead of confirming the stream" >> "$LOG"
+    sleep 30
+    deadline=0
+  else
+    deadline=$(( $(date +%s) + 90 ))
+  fi
+
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    # Tested against a literal count, not for "not zero": a failed call prints
+    # nothing, and treating empty output as success would reintroduce exactly
+    # the false confirmation this loop exists to prevent.
+    found=$(aws logs describe-log-streams \
+              --region "${aws_region}" \
+              --log-group-name "${log_group}" \
+              --log-stream-name-prefix "scanner-dispatch-$${INSTANCE_ID}" \
+              --query 'length(logStreams)' --output text 2>/dev/null)
+    case "$${found}" in
+      ''|*[!0-9]*) : ;;   # no answer or not a number -- keep waiting
+      0)           : ;;
+      *)           published=yes; break ;;
+    esac
+    sleep 5
+  done
+
+  if [ "$${published}" != "yes" ] && [ -n "$${INSTANCE_ID}" ]; then
+    echo "WARNING: no log stream for this instance after waiting; this run's log did not reach CloudWatch" >> "$LOG"
+  fi
+
+  # Stop only after the wait above: stopping first is what truncated the
+  # window in the first place.
+  timeout 60 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a stop >/dev/null 2>&1 || true
+
+  shutdown -h now
+  exit 0
+}
+
+# Before anything else. An AMI without the binary means var.scanner_ami_id was
+# left empty and the stock AL2023 fallback was used -- the same
+# misconfiguration the daemon's user_data guards against, with the same
+# reasoning: fail visibly rather than terminate quietly having scanned nothing.
+if [ ! -x /usr/local/bin/scanner ]; then
+  echo "FATAL: /usr/local/bin/scanner missing -- this AMI was not built by the scanner image build. Set var.scanner_ami_id." >> "$LOG"
+  finish 127
+fi
+
+# The log group name is only known at apply time, so the agent config is
+# written here rather than baked. Same files-collector shape as the daemon's:
+# the Linux agent rejects a journald block outright.
+#
+# Started BEFORE the dispatch run, not after, so the agent's startup overlaps
+# discovery instead of following it. fetch-config returns once the config
+# validates, not once the agent is publishing, so the remaining startup cost is
+# paid while there is work to do rather than while the instance waits to halt.
+mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+cat > /opt/aws/amazon-cloudwatch-agent/etc/scanner-dispatch.json <<'CWAGENT'
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/scanner-dispatch.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "scanner-dispatch-{instance_id}",
+            "timezone": "UTC"
+          }
+        ]
+      }
+    }
+  }
+}
+CWAGENT
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/scanner-dispatch.json \
+  >/dev/null 2>&1 \
+  || echo "WARNING: CloudWatch agent config failed; this run's log stays local" >> "$LOG"
+
+export AWS_REGION="${aws_region}"
+export SCANNER_SCAN_QUEUE_URL="${scan_queue_url}"
+export SCANNER_LOG_LEVEL="${log_level}"
+
+# The run itself. dispatch exits 0 (ok, possibly nothing tagged), 1 (failed),
+# 5 (every discovery leg refused), or 6 (partial discovery -- work enqueued
+# but one asset class went unexamined). All four are distinguishable in the
+# log line finish() writes, which is what the alarm keys on.
+/usr/local/bin/scanner dispatch >> "$LOG" 2>&1
+finish "$?"

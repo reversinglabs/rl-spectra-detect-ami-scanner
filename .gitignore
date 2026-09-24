@@ -1,0 +1,19 @@
+# Terraform state -- holds resource ARNs, account IDs and can hold secrets.
+# Never commit it to a repository that is mirrored publicly.
+terraform.tfstate
+terraform.tfstate.backup
+*.tfstate
+*.tfstate.*
+
+# Variable files carry account-specific IDs. The .example is committed;
+# the real one is not.
+terraform.tfvars
+*.auto.tfvars
+
+.terraform/
+.terraform.lock.hcl
+tfplan
+*.tfplan
+
+crash.log
+crash.*.log
